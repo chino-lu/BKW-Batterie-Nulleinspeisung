@@ -1,0 +1,187 @@
+blueprint:
+  name: Marstek B2500-D Nulleinspeisung Optimiert
+  description: >
+    Steuerung eines Marstek B2500-D Wechselrichters zur echten Nulleinspeisung.
+    Berücksichtigt alle Phasen, PV-Ertrag, LowBat-Priorität und Cooldowns.
+    Version 0.1
+  domain: automation
+  input:
+    micro_inverter_sensor:
+      name: MicroInverter PV (W)
+      description: Liefert die aktuelle PV-Leistung des MicroInverters
+      selector:
+        entity:
+          domain: sensor
+    power_consumed_p1:
+      name: Verbrauch Phase 1 (kW)
+      selector:
+        entity:
+          domain: sensor
+    power_consumed_p2:
+      name: Verbrauch Phase 2 (kW)
+      selector:
+        entity:
+          domain: sensor
+    power_consumed_p3:
+      name: Verbrauch Phase 3 (kW)
+      selector:
+        entity:
+          domain: sensor
+    pv_phase2:
+      name: PV Phase 2 (kW)
+      selector:
+        entity:
+          domain: sensor
+    batteriestand_sensor:
+      name: Batterie-Prozent Sensor
+      selector:
+        entity:
+          domain: sensor
+    charging_mode_select:
+      name: Lademodus Select
+      selector:
+        entity:
+          domain: select
+    output_value_number:
+      name: Zielleistung WR (Number)
+      selector:
+        entity:
+          domain: number
+    switch_enable:
+      name: Aktivierungsschalter WR
+      selector:
+        entity:
+          domain: switch
+    min_watt:
+      name: Minimalwert WR-Leistung (W)
+      default: 30
+      selector:
+        number:
+          min: 0
+          max: 1000
+          unit_of_measurement: W
+    max_watt:
+      name: Maximalwert WR-Leistung (W)
+      default: 800
+      selector:
+        number:
+          min: 0
+          max: 10000
+          unit_of_measurement: W
+    lowbat_threshold:
+      name: LowBat Schwelle (%)
+      default: 11
+      selector:
+        number:
+          min: 0
+          max: 100
+    cooldown_high:
+      name: Cooldown Erhöhung (Sekunden)
+      default: 180
+      selector:
+        number:
+          min: 0
+          max: 3600
+    cooldown_low:
+      name: Cooldown Senkung (Sekunden)
+      default: 15
+      selector:
+        number:
+          min: 0
+          max: 3600
+    cooldown_marker:
+      name: Input Datetime Cooldown Marker
+      description: Wird zur Überprüfung der Cooldowns verwendet
+      selector:
+        entity:
+          domain: input_datetime
+
+trigger:
+  - platform: state
+    entity_id:
+      - !input micro_inverter_sensor
+      - !input power_consumed_p1
+      - !input power_consumed_p2
+      - !input power_consumed_p3
+      - !input pv_phase2
+  - platform: numeric_state
+    entity_id: !input batteriestand_sensor
+    below: !input lowbat_threshold
+
+variables:
+  verbrauch: >-
+    {{ (states(!input.micro_inverter_sensor)|float
+       + states(!input.power_consumed_p1)|float * 1000
+       + states(!input.power_consumed_p2)|float * 1000
+       + states(!input.power_consumed_p3)|float * 1000
+       - states(!input.pv_phase2)|float * 1000) }}
+  batteriestand: "{{ states(!input.batteriestand_sensor)|float }}"
+  now_ts: "{{ as_timestamp(now()) }}"
+  last_trigger_ts: "{{ as_timestamp(states(!input.cooldown_marker)) if states(!input.cooldown_marker) not in [None,'unknown','unavailable'] else 0 }}"
+
+mode: single
+
+action:
+  - choose:
+      # --- LowBat Priorität ---
+      - conditions:
+          - condition: numeric_state
+            entity_id: !input batteriestand_sensor
+            below: !input lowbat_threshold
+        sequence:
+          - service: select.select_option
+            target:
+              entity_id: !input.charging_mode_select
+            data:
+              option: "Fully Charge Then Discharge"
+          - service: number.set_value
+            target:
+              entity_id: !input.output_value_number
+            data:
+              value: 50
+          - service: switch.turn_off
+            target:
+              entity_id: !input.switch_enable
+          - stop: "Akku LowBat, Aktion beendet"
+
+      # --- Normalbetrieb ---
+      - conditions:
+          - condition: template
+            value_template: "{{ verbrauch > 0 }}"
+        sequence:
+          - variables:
+              zielwert: >-
+                {% set val = verbrauch %}
+                {% if val < min_watt %} {{ min_watt }}
+                {% elif val > max_watt %} {{ max_watt }}
+                {% else %} {{ val | round(0) }} {% endif %}
+              cooldown_passed: >-
+                {% set diff = now_ts - last_trigger_ts %}
+                {% if val > states(!input.output_value_number)|float %}
+                  {{ diff > cooldown_high }}
+                {% else %}
+                  {{ diff > cooldown_low }}
+                {% endif %}
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ cooldown_passed }}"
+                sequence:
+                  - service: number.set_value
+                    target:
+                      entity_id: !input.output_value_number
+                    data:
+                      value: "{{ zielwert }}"
+                  - service: switch.turn_on
+                    target:
+                      entity_id: !input.switch_enable
+                  - service: select.select_option
+                    target:
+                      entity_id: !input.charging_mode_select
+                    data:
+                      option: "Simultaneous Charging/Discharging"
+                  - service: input_datetime.set_datetime
+                    target:
+                      entity_id: !input.cooldown_marker
+                    data:
+                      timestamp: "{{ now_ts }}"
